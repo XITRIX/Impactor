@@ -31,6 +31,8 @@ pub(crate) fn device_listener() -> Subscription<Message> {
                                     name: "This Mac".into(),
                                     udid: mac_udid,
                                     device_id: u32::MAX,
+                                    product_type: None,
+                                    lockdown_info_available: false,
                                     usbmuxd_device: None,
                                     is_mac: true,
                                 }));

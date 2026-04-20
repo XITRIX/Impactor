@@ -169,29 +169,36 @@ impl Impactor {
                     .iter()
                     .find(|d| d.to_string() == value)
                     .cloned();
+                let should_refresh_apps = self.utilities_should_refresh_apps();
 
-                if let ImpactorScreen::Utilities(_) = self.current_screen {
-                    let rppairing_enabled = match &self.current_screen {
-                        ImpactorScreen::Utilities(screen) => screen.rppairing_enabled,
-                        _ => false,
-                    };
-                    self.current_screen = ImpactorScreen::Utilities(
-                        utilties::UtilitiesScreen::new(self.selected_device.clone()),
-                    );
-                    return Task::done(Message::UtilitiesScreen(utilties::Message::RefreshApps(
-                        rppairing_enabled,
-                    )));
+                if let ImpactorScreen::Utilities(screen) = &mut self.current_screen {
+                    screen.set_device(self.selected_device.clone());
+                    if !screen.pairing_in_progress() && should_refresh_apps {
+                        return Task::done(Message::UtilitiesScreen(
+                            utilties::Message::RefreshApps(screen.rppairing_enabled),
+                        ));
+                    }
                 }
 
                 Task::none()
             }
             Message::DeviceConnected(device) => {
-                if !self.devices.iter().any(|d| d.device_id == device.device_id) {
+                if let Some(existing) = self
+                    .devices
+                    .iter_mut()
+                    .find(|d| d.device_id == device.device_id)
+                {
+                    *existing = device.clone();
+                } else {
                     self.devices.push(device.clone());
+                }
 
-                    if self.selected_device.is_none() && device.device_id != u32::MAX {
-                        self.selected_device = Some(device.clone());
-                    }
+                if self.selected_device.is_none() && device.device_id != u32::MAX {
+                    self.selected_device = Some(device.clone());
+                } else if self.selected_device.as_ref().map(|d| d.device_id)
+                    == Some(device.device_id)
+                {
+                    self.selected_device = Some(device.clone());
                 }
 
                 if let Some(daemon_devices) = REFRESH_DAEMON_DEVICES.get() {
@@ -199,18 +206,15 @@ impl Impactor {
                         devices.insert(device.udid.clone(), device.clone());
                     }
                 }
+                let should_refresh_apps = self.utilities_should_refresh_apps();
 
-                if let ImpactorScreen::Utilities(_) = self.current_screen {
-                    let rppairing_enabled = match &self.current_screen {
-                        ImpactorScreen::Utilities(screen) => screen.rppairing_enabled,
-                        _ => false,
-                    };
-                    self.current_screen = ImpactorScreen::Utilities(
-                        utilties::UtilitiesScreen::new(self.selected_device.clone()),
-                    );
-                    return Task::done(Message::UtilitiesScreen(utilties::Message::RefreshApps(
-                        rppairing_enabled,
-                    )));
+                if let ImpactorScreen::Utilities(screen) = &mut self.current_screen {
+                    screen.set_device(self.selected_device.clone());
+                    if !screen.pairing_in_progress() && should_refresh_apps {
+                        return Task::done(Message::UtilitiesScreen(
+                            utilties::Message::RefreshApps(screen.rppairing_enabled),
+                        ));
+                    }
                 }
 
                 Task::none()
@@ -224,7 +228,15 @@ impl Impactor {
 
                 self.devices.retain(|d| d.device_id != id);
 
-                if self.selected_device.as_ref().map(|d| d.device_id) == Some(id) {
+                let selected_was_disconnected =
+                    self.selected_device.as_ref().map(|d| d.device_id) == Some(id);
+
+                let pairing_in_progress = matches!(
+                    &self.current_screen,
+                    ImpactorScreen::Utilities(screen) if screen.pairing_in_progress()
+                );
+
+                if selected_was_disconnected && !pairing_in_progress {
                     self.selected_device = self.devices.first().cloned();
                 }
 
@@ -233,18 +245,21 @@ impl Impactor {
                         devices.remove(&udid);
                     }
                 }
+                let should_refresh_apps = self.utilities_should_refresh_apps();
 
-                if let ImpactorScreen::Utilities(_) = self.current_screen {
-                    let rppairing_enabled = match &self.current_screen {
-                        ImpactorScreen::Utilities(screen) => screen.rppairing_enabled,
-                        _ => false,
-                    };
-                    self.current_screen = ImpactorScreen::Utilities(
-                        utilties::UtilitiesScreen::new(self.selected_device.clone()),
-                    );
-                    return Task::done(Message::UtilitiesScreen(utilties::Message::RefreshApps(
-                        rppairing_enabled,
-                    )));
+                if let ImpactorScreen::Utilities(screen) = &mut self.current_screen {
+                    let should_preserve_screen =
+                        pairing_in_progress && screen.selected_device_id() == Some(id);
+
+                    if !should_preserve_screen {
+                        screen.set_device(self.selected_device.clone());
+                    }
+
+                    if !screen.pairing_in_progress() && should_refresh_apps {
+                        return Task::done(Message::UtilitiesScreen(
+                            utilties::Message::RefreshApps(screen.rppairing_enabled),
+                        ));
+                    }
                 }
 
                 Task::none()
@@ -266,9 +281,12 @@ impl Impactor {
                         ImpactorScreen::Utilities(screen) => screen.rppairing_enabled,
                         _ => false,
                     };
-                    return Task::done(Message::UtilitiesScreen(utilties::Message::RefreshApps(
-                        rppairing_enabled,
-                    )));
+
+                    if self.utilities_should_refresh_apps() {
+                        return Task::done(Message::UtilitiesScreen(utilties::Message::RefreshApps(
+                            rppairing_enabled,
+                        )));
+                    }
                 }
 
                 Task::none()
@@ -451,9 +469,14 @@ impl Impactor {
                         self.current_screen = ImpactorScreen::Utilities(
                             utilties::UtilitiesScreen::new(self.selected_device.clone()),
                         );
-                        return Task::done(Message::UtilitiesScreen(
-                            utilties::Message::RefreshApps(rppairing_enabled),
-                        ));
+
+                        if self.utilities_should_refresh_apps() {
+                            return Task::done(Message::UtilitiesScreen(
+                                utilties::Message::RefreshApps(rppairing_enabled),
+                            ));
+                        }
+
+                        return Task::none();
                     }
 
                     task
@@ -960,6 +983,12 @@ impl Impactor {
             }
             _ => {}
         }
+    }
+
+    fn utilities_should_refresh_apps(&self) -> bool {
+        self.selected_device
+            .as_ref()
+            .is_some_and(|device| !device.is_mac && !device.supports_apple_tv_pairing())
     }
 
     fn start_installation_task(&mut self) -> Task<Message> {

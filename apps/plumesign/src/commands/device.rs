@@ -54,6 +54,8 @@ pub async fn execute(args: DeviceArgs) -> Result<()> {
                     name: "My Mac".to_string(),
                     udid: String::new(),
                     device_id: 0,
+                    product_type: None,
+                    lockdown_info_available: false,
                     usbmuxd_device: None,
                     is_mac: true,
                 }

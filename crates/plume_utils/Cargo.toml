@@ -17,6 +17,8 @@ futures.workspace = true
 log.workspace = true
 image.workspace = true
 goblin.workspace = true
+zeroconf = "0.18"
+if-addrs = "0.15"
 plume_core = { path = "../plume_core", features = ["tweaks"] }
 plume_store = { path = "../plume_store" }
 
