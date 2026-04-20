@@ -1,5 +1,6 @@
 use iced::{Subscription, window};
 use idevice::usbmuxd::{UsbmuxdConnection, UsbmuxdListenEvent};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tray_icon::{TrayIconEvent, menu::MenuEvent};
 
@@ -16,6 +17,54 @@ pub(crate) fn device_listener() -> Subscription<Message> {
             |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
                 use iced::futures::{SinkExt, StreamExt};
                 let (tx, mut rx) = iced::futures::channel::mpsc::unbounded::<Message>();
+
+                let remote_tx = tx.clone();
+                std::thread::spawn(move || {
+                    let mut known_devices = HashMap::<u32, Device>::new();
+
+                    loop {
+                        match Device::discover_remote_pairing_devices() {
+                            Ok(devices) => {
+                                let mut seen_ids = HashSet::new();
+
+                                for device in devices {
+                                    seen_ids.insert(device.device_id);
+
+                                    let should_send_connected = known_devices
+                                        .get(&device.device_id)
+                                        .is_none_or(|existing| {
+                                            existing.name != device.name
+                                                || existing.network_address()
+                                                    != device.network_address()
+                                        });
+
+                                    if should_send_connected {
+                                        let _ = remote_tx
+                                            .unbounded_send(Message::DeviceConnected(device.clone()));
+                                    }
+
+                                    known_devices.insert(device.device_id, device);
+                                }
+
+                                let stale_ids: Vec<_> = known_devices
+                                    .keys()
+                                    .copied()
+                                    .filter(|id| !seen_ids.contains(id))
+                                    .collect();
+
+                                for id in stale_ids {
+                                    known_devices.remove(&id);
+                                    let _ = remote_tx.unbounded_send(Message::DeviceDisconnected(id));
+                                }
+                            }
+                            Err(error) => {
+                                log::debug!("Failed to discover remote pairing devices: {error}");
+                            }
+                        }
+
+                        std::thread::sleep(std::time::Duration::from_secs(5));
+                    }
+                });
 
                 std::thread::spawn(move || {
                     let rt = tokio::runtime::Builder::new_current_thread()
@@ -34,6 +83,7 @@ pub(crate) fn device_listener() -> Subscription<Message> {
                                     product_type: None,
                                     lockdown_info_available: false,
                                     usbmuxd_device: None,
+                                    remote_address: None,
                                     is_mac: true,
                                 }));
                             }

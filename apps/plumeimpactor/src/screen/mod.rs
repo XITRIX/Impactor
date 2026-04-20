@@ -183,20 +183,27 @@ impl Impactor {
                 Task::none()
             }
             Message::DeviceConnected(device) => {
-                if let Some(existing) = self
+                let device = if let Some(existing) = self
                     .devices
                     .iter_mut()
-                    .find(|d| d.device_id == device.device_id)
+                    .find(|existing| Self::same_device_identity(existing, &device))
                 {
-                    *existing = device.clone();
+                    if Self::should_replace_device(existing, &device) {
+                        *existing = device.clone();
+                    }
+
+                    existing.clone()
                 } else {
                     self.devices.push(device.clone());
-                }
+                    device
+                };
 
                 if self.selected_device.is_none() && device.device_id != u32::MAX {
                     self.selected_device = Some(device.clone());
-                } else if self.selected_device.as_ref().map(|d| d.device_id)
-                    == Some(device.device_id)
+                } else if self
+                    .selected_device
+                    .as_ref()
+                    .is_some_and(|selected| Self::same_device_identity(selected, &device))
                 {
                     self.selected_device = Some(device.clone());
                 }
@@ -283,9 +290,9 @@ impl Impactor {
                     };
 
                     if self.utilities_should_refresh_apps() {
-                        return Task::done(Message::UtilitiesScreen(utilties::Message::RefreshApps(
-                            rppairing_enabled,
-                        )));
+                        return Task::done(Message::UtilitiesScreen(
+                            utilties::Message::RefreshApps(rppairing_enabled),
+                        ));
                     }
                 }
 
@@ -988,7 +995,30 @@ impl Impactor {
     fn utilities_should_refresh_apps(&self) -> bool {
         self.selected_device
             .as_ref()
-            .is_some_and(|device| !device.is_mac && !device.supports_apple_tv_pairing())
+            .is_some_and(|device| !device.is_mac && !device.supports_remote_pairing())
+    }
+
+    fn same_device_identity(left: &Device, right: &Device) -> bool {
+        if left.device_id == right.device_id {
+            return true;
+        }
+
+        if !left.udid.is_empty() && left.udid == right.udid {
+            return true;
+        }
+
+        matches!((left.network_address(), right.network_address()), (Some(left_ip), Some(right_ip)) if left_ip == right_ip)
+            && (left.name.is_empty()
+                || right.name.is_empty()
+                || left.name.eq_ignore_ascii_case(&right.name))
+    }
+
+    fn should_replace_device(existing: &Device, incoming: &Device) -> bool {
+        match (existing.usbmuxd_device.is_some(), incoming.usbmuxd_device.is_some()) {
+            (true, false) => false,
+            (false, true) => true,
+            _ => true,
+        }
     }
 
     fn start_installation_task(&mut self) -> Task<Message> {

@@ -129,7 +129,7 @@ impl UtilitiesScreen {
                         return Task::none();
                     }
 
-                    if device.supports_apple_tv_pairing() {
+                    if device.supports_remote_pairing() {
                         self.loading = false;
                         self.installed_apps.clear();
                         return Task::none();
@@ -214,17 +214,17 @@ impl UtilitiesScreen {
                 if let Some(device) = &self.device {
                     let device = device.clone();
 
-                    let pair_task = if device.can_attempt_remote_pairing() {
+                    let pair_task = if device.supports_remote_pairing() {
                         let pin_state = Arc::new((Mutex::new(None), Condvar::new()));
                         self.apple_tv_pin_prompt = Some(AppleTvPinPrompt::new(pin_state.clone()));
 
                         let rx = spawn_runtime_task(async move {
                             device
-                                .pair_apple_tv(get_data_path(), move || {
+                                .pair_remote_device(get_data_path(), move || {
                                     wait_for_pin_submission(pin_state.clone())
                                 })
                                 .await
-                                .map_err(|e| format!("Failed to pair Apple TV: {}", e))
+                                .map_err(|e| format!("Failed to pair remote device: {}", e))
                         });
 
                         Task::perform(
@@ -266,7 +266,7 @@ impl UtilitiesScreen {
                 }
             }
             Message::ExportAppleTvPairingFile => {
-                let Some(pairing_file_path) = self.apple_tv_pairing_file_path() else {
+                let Some(pairing_file_path) = self.remote_pairing_file_path() else {
                     self.status_message = Some(StatusMessage::error(t!(
                         "utilities_apple_tv_pairing_file_missing"
                     )));
@@ -291,16 +291,14 @@ impl UtilitiesScreen {
                                 pairing_file_path
                                     .file_name()
                                     .and_then(|name| name.to_str())
-                                    .unwrap_or("apple_tv_pairing.plist"),
+                                    .unwrap_or("remote_pairing.plist"),
                             )
                             .save_file()
                             .await;
 
                         if let Some(save_path) = file {
                             std::fs::copy(&pairing_file_path, save_path.path()).map_err(
-                                |error| {
-                                    format!("Failed to export Apple TV pairing file: {error}")
-                                },
+                                |error| format!("Failed to export Apple TV pairing file: {error}"),
                             )?;
                             Ok(true)
                         } else {
@@ -394,10 +392,10 @@ impl UtilitiesScreen {
 
     pub fn view(&self) -> Element<'_, Message> {
         let mut content = column![].spacing(appearance::THEME_PADDING);
-        let is_apple_tv = self
+        let uses_remote_pairing = self
             .device
             .as_ref()
-            .is_some_and(Device::supports_apple_tv_pairing);
+            .is_some_and(Device::supports_remote_pairing);
 
         if let Some(ref device) = self.device {
             let mut device_details = column![
@@ -432,14 +430,14 @@ impl UtilitiesScreen {
             };
 
             let trust_button_text = if self.trust_loading {
-                t!("utilities_pairing")
-            } else if is_apple_tv {
-                t!("utilities_pair_apple_tv")
+                t!("utilities_pairing").to_string()
+            } else if uses_remote_pairing {
+                self.remote_pairing_button_label()
             } else {
-                t!("utilities_trust_device")
+                t!("utilities_trust_device").to_string()
             };
 
-            if is_apple_tv {
+            if uses_remote_pairing {
                 let pair_button = button(text(trust_button_text).align_x(Center))
                     .on_press_maybe(if self.trust_loading {
                         None
@@ -449,7 +447,7 @@ impl UtilitiesScreen {
                     .style(appearance::s_button)
                     .width(Fill);
 
-                let pairing_actions = if self.has_apple_tv_pairing_file() {
+                let pairing_actions = if self.has_remote_pairing_file() {
                     row![
                         pair_button,
                         button(text(t!("utilities_export_pairing")).align_x(Center))
@@ -490,7 +488,7 @@ impl UtilitiesScreen {
             }
         }
 
-        if !is_apple_tv {
+        if !uses_remote_pairing {
             let toggle = toggler(self.rppairing_enabled)
                 .label(t!("utilities_use_remote_pairing"))
                 .on_toggle(Message::ToggleRPPairing);
@@ -498,7 +496,7 @@ impl UtilitiesScreen {
             content = content.push(toggle);
         }
 
-        if !is_apple_tv && !self.installed_apps.is_empty() {
+        if !uses_remote_pairing && !self.installed_apps.is_empty() {
             content = content
                 .push(container(rule::horizontal(1)).padding([appearance::THEME_PADDING, 0.0]));
 
@@ -564,22 +562,22 @@ impl UtilitiesScreen {
         self.device.as_ref().map(|device| device.device_id)
     }
 
-    fn apple_tv_pairing_file_path(&self) -> Option<PathBuf> {
-        let device = self.device.as_ref()?;
-        if !device.supports_apple_tv_pairing() {
-            return None;
+    fn remote_pairing_button_label(&self) -> String {
+        match self.device.as_ref() {
+            Some(device) if device.is_apple_vision() => t!("utilities_pair_apple_vision").to_string(),
+            Some(device) if device.is_apple_tv() => t!("utilities_pair_apple_tv").to_string(),
+            Some(_) => t!("utilities_pair_remote_device").to_string(),
+            None => t!("utilities_pair_remote_device").to_string(),
         }
-
-        Some(
-            get_data_path()
-                .join("appletv_pairing")
-                .join(format!("plume_{}.plist", device.udid.replace(':', "_"))),
-        )
     }
 
-    fn has_apple_tv_pairing_file(&self) -> bool {
-        self.apple_tv_pairing_file_path()
-            .is_some_and(|path| path.is_file())
+    fn remote_pairing_file_path(&self) -> Option<PathBuf> {
+        let device = self.device.as_ref()?;
+        device.existing_remote_pairing_file_path(get_data_path())
+    }
+
+    fn has_remote_pairing_file(&self) -> bool {
+        self.remote_pairing_file_path().is_some()
     }
 
     fn view_apple_tv_pin_prompt(&self) -> Element<'_, Message> {
@@ -604,7 +602,7 @@ impl UtilitiesScreen {
         };
 
         let mut dialog_content = column![
-            text(t!("utilities_pair_apple_tv")).size(appearance::THEME_FONT_SIZE + 2.0),
+            text(self.remote_pairing_button_label()).size(appearance::THEME_FONT_SIZE + 2.0),
             text(t!("utilities_apple_tv_pin_prompt")).size(14),
             pin_input,
             button(text(submit_label))

@@ -57,6 +57,7 @@ pub async fn execute(args: DeviceArgs) -> Result<()> {
                     product_type: None,
                     lockdown_info_available: false,
                     usbmuxd_device: None,
+                    remote_address: None,
                     is_mac: true,
                 }
             } else {

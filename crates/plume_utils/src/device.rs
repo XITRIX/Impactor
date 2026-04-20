@@ -1,5 +1,6 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -38,6 +39,8 @@ const APPLE_TV_MANUAL_PAIRING_SERVICE: &str = "remotepairing-manual-pairing";
 const APPLE_TV_LEGACY_PAIRING_SERVICE: &str = "remotepairing";
 const MDNS_SERVICE_PROTOCOL: &str = "tcp";
 const DEFAULT_APPLE_TV_LEGACY_REMOTE_PAIRING_PORT: u16 = 49152;
+const REMOTE_PAIRING_DIR: &str = "remote_pairing";
+const LEGACY_APPLE_TV_PAIRING_DIR: &str = "appletv_pairing";
 
 macro_rules! get_dict_string {
     ($dict:expr, $key:expr) => {
@@ -58,6 +61,7 @@ pub struct Device {
     pub product_type: Option<String>,
     pub lockdown_info_available: bool,
     pub usbmuxd_device: Option<UsbmuxdDevice>,
+    pub remote_address: Option<IpAddr>,
     // On x86_64 macs, `is_mac` variable should never be true
     // since its only true if the device is added manually.
     pub is_mac: bool,
@@ -94,6 +98,10 @@ impl Device {
             device_id: usbmuxd_device.device_id.clone(),
             product_type,
             lockdown_info_available,
+            remote_address: match &usbmuxd_device.connection_type {
+                Connection::Network(addr) => Some(*addr),
+                _ => None,
+            },
             usbmuxd_device: Some(usbmuxd_device),
             is_mac: false,
         }
@@ -122,13 +130,11 @@ impl Device {
             } else {
                 None
             }
-        })
+        }).or(self.remote_address)
     }
 
     pub fn can_attempt_remote_pairing(&self) -> bool {
-        self.usbmuxd_device
-            .as_ref()
-            .is_some_and(|device| !matches!(device.connection_type, Connection::Usb))
+        self.network_address().is_some()
     }
 
     pub fn is_apple_tv(&self) -> bool {
@@ -139,9 +145,100 @@ impl Device {
             || (self.network_address().is_some() && self.udid.contains(':'))
     }
 
-    pub fn supports_apple_tv_pairing(&self) -> bool {
+    pub fn is_apple_vision(&self) -> bool {
+        let name = self.name.to_ascii_lowercase();
+
+        self.product_type
+            .as_deref()
+            .is_some_and(|product_type| product_type.starts_with("RealityDevice"))
+            || name.contains("vision pro")
+            || name.contains("apple vision")
+    }
+
+    pub fn is_remote_pairing_device(&self) -> bool {
+        self.is_apple_tv() || self.is_apple_vision()
+    }
+
+    pub fn supports_remote_pairing(&self) -> bool {
         self.can_attempt_remote_pairing()
-            && (self.is_apple_tv() || !self.lockdown_info_available || self.name.is_empty())
+            && (self.is_remote_pairing_device()
+                || !self.lockdown_info_available
+                || self.name.is_empty())
+    }
+
+    pub fn supports_apple_tv_pairing(&self) -> bool {
+        self.supports_remote_pairing()
+    }
+
+    fn remote_pairing_file_name(&self) -> String {
+        format!("plume_{}.plist", self.udid.replace(':', "_"))
+    }
+
+    pub fn remote_pairing_file_path(&self, path_to_store: PathBuf) -> Option<PathBuf> {
+        if !self.supports_remote_pairing() {
+            return None;
+        }
+
+        Some(
+            path_to_store
+                .join(REMOTE_PAIRING_DIR)
+                .join(self.remote_pairing_file_name()),
+        )
+    }
+
+    pub fn existing_remote_pairing_file_path(&self, path_to_store: PathBuf) -> Option<PathBuf> {
+        let pairing_file_path = self.remote_pairing_file_path(path_to_store.clone())?;
+        if pairing_file_path.is_file() {
+            return Some(pairing_file_path);
+        }
+
+        let legacy_pairing_file_path = path_to_store
+            .join(LEGACY_APPLE_TV_PAIRING_DIR)
+            .join(self.remote_pairing_file_name());
+
+        if legacy_pairing_file_path.is_file() {
+            Some(legacy_pairing_file_path)
+        } else {
+            None
+        }
+    }
+
+    pub fn discover_remote_pairing_devices() -> Result<Vec<Self>, Error> {
+        let mut endpoints_by_address = HashMap::<IpAddr, AppleTvRemotePairingEndpoint>::new();
+
+        for service_name in [
+            APPLE_TV_MANUAL_PAIRING_SERVICE,
+            APPLE_TV_LEGACY_PAIRING_SERVICE,
+        ] {
+            for endpoint in Self::discover_remote_pairing_endpoints_with_mdns(service_name)? {
+                let Some(remote_address) = endpoint
+                    .device_address
+                    .or_else(|| Self::parse_remote_pairing_address(&endpoint.service_address))
+                else {
+                    continue;
+                };
+
+                let should_replace = endpoints_by_address
+                    .get(&remote_address)
+                    .is_none_or(|existing| {
+                        Self::remote_pairing_service_priority(&endpoint.service_type)
+                            < Self::remote_pairing_service_priority(&existing.service_type)
+                    });
+
+                if should_replace {
+                    endpoints_by_address.insert(remote_address, endpoint);
+                }
+            }
+        }
+
+        let mut devices: Vec<_> = endpoints_by_address
+            .into_values()
+            .filter_map(Self::remote_pairing_device_from_endpoint)
+            .collect();
+
+        devices.sort_by(|left, right| left.name.cmp(&right.name));
+
+        Ok(devices)
     }
 
     pub async fn installed_apps(&self) -> Result<Vec<SignerAppReal>, Error> {
@@ -236,7 +333,7 @@ impl Device {
         Ok(())
     }
 
-    pub async fn pair_apple_tv<F>(
+    pub async fn pair_remote_device<F>(
         &self,
         path_to_store: PathBuf,
         pin_provider: F,
@@ -252,46 +349,87 @@ impl Device {
             .chars()
             .take(6)
             .collect();
-        let hostname = format!("plume-appletv-{suffix}");
-        let endpoint = match Self::discover_remote_pairing_endpoint(ip, &self.name) {
-            Ok(endpoint) => endpoint,
-            Err(error) => {
-                log::warn!("Falling back to usbmuxd network address for Apple TV pairing: {error}");
-                let Some(ip) = ip else {
-                    return Err(error);
-                };
-                AppleTvRemotePairingEndpoint {
-                    service_type: APPLE_TV_LEGACY_PAIRING_SERVICE.to_string(),
-                    service_name: self.name.clone(),
-                    host_name: ip.to_string(),
-                    service_address: ip.to_string(),
-                    port: DEFAULT_APPLE_TV_LEGACY_REMOTE_PAIRING_PORT,
-                    device_address: Some(ip),
+        let hostname = format!("plume-remote-{suffix}");
+        let pin_provider: Arc<dyn Fn() -> String + Send + Sync> = Arc::new(pin_provider);
+        let endpoints = Self::discover_candidate_remote_pairing_endpoints(ip, &self.name)?;
+        let mut attempt_errors = Vec::new();
+
+        for endpoint in endpoints {
+            let mut pairing_file = RpPairingFile::generate(&hostname);
+
+            match Self::connect_apple_tv_pairing_socket(
+                &endpoint,
+                &hostname,
+                &mut pairing_file,
+                Some(pin_provider.clone()),
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(error) => {
+                    attempt_errors.push(format!(
+                        "{} '{}' at {}:{}: {}",
+                        endpoint.service_type,
+                        endpoint.service_name,
+                        endpoint.host_name,
+                        endpoint.port,
+                        error
+                    ));
+                    continue;
                 }
             }
-        };
-        let pin_provider: Arc<dyn Fn() -> String + Send + Sync> = Arc::new(pin_provider);
 
-        let mut pairing_file = RpPairingFile::generate(&hostname);
-        Self::connect_apple_tv_pairing_socket(
-            &endpoint,
-            &hostname,
-            &mut pairing_file,
-            Some(pin_provider.clone()),
-        )
-        .await?;
+            match Self::connect_apple_tv_pairing_socket(&endpoint, &hostname, &mut pairing_file, None)
+                .await
+            {
+                Ok(()) => {
+                    let pairing_file_path = self
+                        .remote_pairing_file_path(path_to_store.clone())
+                        .ok_or_else(|| {
+                            Error::Other(
+                                "Remote pairing is not supported for this device".to_string(),
+                            )
+                        })?;
 
-        // Mirror idevice's tool flow and reconnect once to validate the pairing file.
-        Self::connect_apple_tv_pairing_socket(&endpoint, &hostname, &mut pairing_file, None)
-            .await?;
+                    if let Some(parent) = pairing_file_path.parent() {
+                        tokio::fs::create_dir_all(parent).await?;
+                    }
 
-        let pairing_dir = path_to_store.join("appletv_pairing");
-        tokio::fs::create_dir_all(&pairing_dir).await?;
-        let pairing_file_path =
-            pairing_dir.join(format!("plume_{}.plist", self.udid.replace(':', "_")));
-        pairing_file.write_to_file(&pairing_file_path).await?;
+                    pairing_file.write_to_file(&pairing_file_path).await?;
+                    return Ok(());
+                }
+                Err(error) => {
+                    attempt_errors.push(format!(
+                        "{} '{}' validation at {}:{}: {}",
+                        endpoint.service_type,
+                        endpoint.service_name,
+                        endpoint.host_name,
+                        endpoint.port,
+                        error
+                    ));
+                }
+            }
+        }
 
-        Ok(())
+        Err(Error::Other(format!(
+            "Remote pairing failed. Attempts: {}",
+            if attempt_errors.is_empty() {
+                "no candidate endpoints were available".to_string()
+            } else {
+                attempt_errors.join(" | ")
+            }
+        )))
+    }
+
+    pub async fn pair_apple_tv<F>(
+        &self,
+        path_to_store: PathBuf,
+        pin_provider: F,
+    ) -> Result<(), Error>
+    where
+        F: Fn() -> String + Send + Sync + 'static,
+    {
+        self.pair_remote_device(path_to_store, pin_provider).await
     }
 
     pub async fn install_pairing_record(
@@ -493,7 +631,7 @@ impl Device {
                 Err(error) => {
                     errors.push(format!("{target}: {error}"));
                     log::debug!(
-                        "Failed to connect to Apple TV remotepairing target {}:{}: {}",
+                        "Failed to connect to remotepairing target {}:{}: {}",
                         target,
                         endpoint.port,
                         error
@@ -510,7 +648,7 @@ impl Device {
                     Err(error) => {
                         errors.push(format!("{target}: {error}"));
                         log::debug!(
-                            "Failed to connect to Apple TV device address {}:{}: {}",
+                            "Failed to connect to remote-pairing device address {}:{}: {}",
                             target,
                             endpoint.port,
                             error
@@ -521,7 +659,7 @@ impl Device {
         }
 
         Err(Error::Other(format!(
-            "Unable to connect to Apple TV {} service '{}' on port {}. Attempts: {}",
+            "Unable to connect to remote-pairing {} service '{}' on port {}. Attempts: {}",
             endpoint.service_type,
             endpoint.service_name,
             endpoint.port,
@@ -546,14 +684,14 @@ impl Device {
             .await
             .map_err(|error| {
                 Error::Other(format!(
-                    "Failed to resolve Apple TV remotepairing endpoint {target}:{port}: {error}"
+                    "Failed to resolve remotepairing endpoint {target}:{port}: {error}"
                 ))
             })?
             .collect();
 
         if addrs.is_empty() {
             return Err(Error::Other(format!(
-                "No socket addresses resolved for Apple TV remotepairing endpoint {target}:{port}"
+                "No socket addresses resolved for remotepairing endpoint {target}:{port}"
             )));
         }
 
@@ -580,11 +718,11 @@ impl Device {
 
         if let Some((addr, error)) = last_error {
             Err(Error::Other(format!(
-                "Failed to connect to Apple TV remotepairing endpoint {target}:{port} via {addr}: {error}"
+                "Failed to connect to remotepairing endpoint {target}:{port} via {addr}: {error}"
             )))
         } else {
             Err(Error::Other(format!(
-                "Unable to connect to Apple TV remotepairing endpoint {target}:{port}"
+                "Unable to connect to remotepairing endpoint {target}:{port}"
             )))
         }
     }
@@ -606,7 +744,7 @@ impl Device {
     ) -> Result<tokio::net::TcpStream, Error> {
         let interfaces = get_if_addrs().map_err(|error| {
             Error::Other(format!(
-                "Failed to enumerate local interfaces for Apple TV IPv6 routing: {error}"
+                "Failed to enumerate local interfaces for remote-pairing IPv6 routing: {error}"
             ))
         })?;
 
@@ -629,7 +767,7 @@ impl Device {
 
         if candidates.is_empty() {
             return Err(Error::Other(format!(
-                "No active IPv6 link-local interfaces were found for Apple TV address {ip}"
+                "No active IPv6 link-local interfaces were found for remote-pairing address {ip}"
             )));
         }
 
@@ -645,11 +783,11 @@ impl Device {
 
         if let Some((name, index, error)) = last_error {
             Err(Error::Other(format!(
-                "Failed to connect to Apple TV link-local address {ip}%{name} (scope {index}) on port {port}: {error}"
+                "Failed to connect to remote-pairing link-local address {ip}%{name} (scope {index}) on port {port}: {error}"
             )))
         } else {
             Err(Error::Other(format!(
-                "Unable to connect to Apple TV link-local address {ip} on port {port}"
+                "Unable to connect to remote-pairing link-local address {ip} on port {port}"
             )))
         }
     }
@@ -662,7 +800,7 @@ impl Device {
         match Self::discover_remote_pairing_endpoint_with_dns_sd(ip, device_name) {
             Ok(endpoint) => return Ok(endpoint),
             Err(error) => log::debug!(
-                "dns-sd Apple TV pairing discovery failed for {}: {}",
+                "dns-sd remote pairing discovery failed for {}: {}",
                 device_name,
                 error
             ),
@@ -685,7 +823,7 @@ impl Device {
         }
 
         Err(Error::Other(format!(
-            "No matching Apple TV pairing service was found for '{}' ({})",
+            "No matching remote-pairing service was found for '{}' ({})",
             device_name,
             ip.map(|ip| ip.to_string())
                 .unwrap_or_else(|| "unknown address".to_string())
@@ -744,7 +882,7 @@ impl Device {
             .cloned()
         {
             log::warn!(
-                "Matched Apple TV remotepairing service by name instead of IP: {} ({})",
+                "Matched remotepairing service by name instead of IP: {} ({})",
                 endpoint.service_name,
                 endpoint.service_address
             );
@@ -754,7 +892,7 @@ impl Device {
         if discovered.len() == 1 {
             let endpoint = discovered.remove(0);
             log::warn!(
-                "Using the only discovered Apple TV remotepairing service: {} ({})",
+                "Using the only discovered remotepairing service: {} ({})",
                 endpoint.service_name,
                 endpoint.service_address
             );
@@ -762,11 +900,189 @@ impl Device {
         }
 
         Err(Error::Other(format!(
-            "No matching _{service_name}._tcp service found for Apple TV '{}' ({})",
+            "No matching _{service_name}._tcp service found for remote-pairing device '{}' ({})",
             device_name,
             ip.map(|ip| ip.to_string())
                 .unwrap_or_else(|| "unknown address".to_string())
         )))
+    }
+
+    fn discover_remote_pairing_endpoints_with_mdns(
+        service_name: &str,
+    ) -> Result<Vec<AppleTvRemotePairingEndpoint>, Error> {
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let service = ServiceType::new(service_name, MDNS_SERVICE_PROTOCOL)
+            .map_err(|e| Error::Other(format!("Failed to create mDNS service type: {e}")))?;
+        let mut browser = MdnsBrowser::new(service);
+        let service_name_owned = service_name.to_string();
+        browser.set_service_callback(Box::new(move |result, _| {
+            if let Ok(BrowserEvent::Add(service)) = result {
+                let device_address = Self::parse_remote_pairing_address(&service.address().to_string());
+                let _ = tx.send(AppleTvRemotePairingEndpoint {
+                    service_type: service_name_owned.clone(),
+                    service_name: service.name().to_string(),
+                    host_name: service.host_name().to_string(),
+                    service_address: service.address().to_string(),
+                    port: *service.port(),
+                    device_address,
+                });
+            }
+        }));
+
+        let event_loop = browser
+            .browse_services()
+            .map_err(|e| Error::Other(format!("Failed to browse {service_name} services: {e}")))?;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut discovered = Vec::new();
+        let mut seen = HashSet::new();
+
+        while Instant::now() < deadline {
+            event_loop
+                .poll(Duration::from_millis(100))
+                .map_err(|e| Error::Other(format!("Failed to poll {service_name} services: {e}")))?;
+
+            while let Ok(endpoint) = rx.try_recv() {
+                let endpoint_key = format!(
+                    "{}|{}|{}|{}",
+                    endpoint.service_type,
+                    endpoint.host_name,
+                    endpoint.service_address,
+                    endpoint.port
+                );
+
+                if seen.insert(endpoint_key) {
+                    discovered.push(endpoint);
+                }
+            }
+        }
+
+        Ok(discovered)
+    }
+
+    fn remote_pairing_device_from_endpoint(endpoint: AppleTvRemotePairingEndpoint) -> Option<Self> {
+        let remote_address = endpoint
+            .device_address
+            .or_else(|| Self::parse_remote_pairing_address(&endpoint.service_address))?;
+
+        let mut name = endpoint.service_name.trim().to_string();
+        if name.is_empty() {
+            name = Self::sanitize_remote_pairing_target(&endpoint.host_name);
+        }
+        if name.is_empty() {
+            name = remote_address.to_string();
+        }
+
+        let device_seed = if endpoint.host_name.trim().is_empty() {
+            remote_address.to_string()
+        } else {
+            Self::sanitize_remote_pairing_target(&endpoint.host_name)
+        };
+
+        Some(Self {
+            name: name.clone(),
+            udid: device_seed.clone(),
+            device_id: Self::stable_remote_pairing_device_id(&device_seed),
+            product_type: Self::infer_remote_pairing_product_type(&name),
+            lockdown_info_available: false,
+            usbmuxd_device: None,
+            remote_address: Some(remote_address),
+            is_mac: false,
+        })
+    }
+
+    fn infer_remote_pairing_product_type(name: &str) -> Option<String> {
+        let lower_name = name.to_ascii_lowercase();
+
+        if lower_name.contains("vision pro") || lower_name.contains("apple vision") {
+            Some("RealityDevice".to_string())
+        } else if lower_name.contains("apple tv") {
+            Some("AppleTV".to_string())
+        } else {
+            None
+        }
+    }
+
+    fn stable_remote_pairing_device_id(seed: &str) -> u32 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        seed.hash(&mut hasher);
+
+        ((hasher.finish() as u32) & 0x3fff_ffff) | 0x4000_0000
+    }
+
+    fn remote_pairing_service_priority(service_type: &str) -> u8 {
+        match service_type {
+            APPLE_TV_MANUAL_PAIRING_SERVICE => 0,
+            APPLE_TV_LEGACY_PAIRING_SERVICE => 1,
+            _ => 2,
+        }
+    }
+
+    fn discover_candidate_remote_pairing_endpoints(
+        ip: Option<IpAddr>,
+        device_name: &str,
+    ) -> Result<Vec<AppleTvRemotePairingEndpoint>, Error> {
+        let mut endpoints = Vec::new();
+        let mut seen = HashSet::new();
+
+        #[cfg(target_vendor = "apple")]
+        if let Ok(endpoint) = Self::discover_remote_pairing_endpoint_with_dns_sd(ip, device_name) {
+            let key = format!(
+                "{}|{}|{}|{}",
+                endpoint.service_type, endpoint.host_name, endpoint.service_address, endpoint.port
+            );
+            if seen.insert(key) {
+                endpoints.push(endpoint);
+            }
+        }
+
+        for service_name in [
+            APPLE_TV_MANUAL_PAIRING_SERVICE,
+            APPLE_TV_LEGACY_PAIRING_SERVICE,
+        ] {
+            if let Ok(endpoint) =
+                Self::discover_remote_pairing_endpoint_with_mdns(ip, device_name, service_name)
+            {
+                let key = format!(
+                    "{}|{}|{}|{}",
+                    endpoint.service_type,
+                    endpoint.host_name,
+                    endpoint.service_address,
+                    endpoint.port
+                );
+                if seen.insert(key) {
+                    endpoints.push(endpoint);
+                }
+            }
+        }
+
+        if endpoints.is_empty() {
+            let endpoint = match Self::discover_remote_pairing_endpoint(ip, device_name) {
+                Ok(endpoint) => endpoint,
+                Err(error) => {
+                    log::warn!("Falling back to usbmuxd network address for remote pairing: {error}");
+                    let Some(ip) = ip else {
+                        return Err(error);
+                    };
+                    AppleTvRemotePairingEndpoint {
+                        service_type: APPLE_TV_LEGACY_PAIRING_SERVICE.to_string(),
+                        service_name: device_name.to_string(),
+                        host_name: ip.to_string(),
+                        service_address: ip.to_string(),
+                        port: DEFAULT_APPLE_TV_LEGACY_REMOTE_PAIRING_PORT,
+                        device_address: Some(ip),
+                    }
+                }
+            };
+            endpoints.push(endpoint);
+        }
+
+        endpoints.sort_by_key(|endpoint| Self::remote_pairing_service_priority(&endpoint.service_type));
+        Ok(endpoints)
+    }
+
+    fn parse_remote_pairing_address(address: &str) -> Option<IpAddr> {
+        Self::normalize_network_address(address).parse().ok()
     }
 
     fn apple_tv_endpoint_matches_ip(
@@ -851,7 +1167,7 @@ impl Device {
         }
 
         Err(Error::Other(format!(
-            "dns-sd could not find a matching Apple TV pairing service for '{}'. Attempts: {}",
+            "dns-sd could not find a matching remote-pairing service for '{}'. Attempts: {}",
             device_name,
             errors.join(" | ")
         )))
@@ -880,7 +1196,7 @@ impl Device {
                 Ok(output) => output,
                 Err(error) => {
                     log::debug!(
-                        "Failed to resolve Apple TV {} instance {}: {}",
+                        "Failed to resolve remotepairing {} instance {}: {}",
                         service_name,
                         instance,
                         error
@@ -900,7 +1216,7 @@ impl Device {
                 Ok(output) => output,
                 Err(error) => {
                     log::debug!(
-                        "Failed to resolve Apple TV host {} via dns-sd: {}",
+                        "Failed to resolve remote-pairing host {} via dns-sd: {}",
                         host_name,
                         error
                     );
@@ -973,7 +1289,7 @@ impl Device {
         }
 
         Err(Error::Other(format!(
-            "dns-sd could not find a matching Apple TV {service_name} service for '{}'",
+            "dns-sd could not find a matching remotepairing {service_name} service for '{}'",
             device_name
         )))
     }
@@ -1182,17 +1498,20 @@ fn get_app_name_from_info(info: &Value) -> Option<String> {
 
 impl fmt::Display for Device {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let connection_type = match &self.usbmuxd_device {
+            Some(device) => match &device.connection_type {
+                Connection::Usb => "USB",
+                Connection::Network(_) => "WiFi",
+                Connection::Unknown(_) => "Unknown",
+            },
+            None if self.remote_address.is_some() => "WiFi",
+            None => "LOCAL",
+        };
+
         write!(
             f,
             "[{}] {}",
-            match &self.usbmuxd_device {
-                Some(device) => match &device.connection_type {
-                    Connection::Usb => "USB",
-                    Connection::Network(_) => "WiFi",
-                    Connection::Unknown(_) => "Unknown",
-                },
-                None => "LOCAL",
-            },
+            connection_type,
             self.name
         )
     }
